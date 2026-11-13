@@ -690,10 +690,14 @@ def pipeline_findings(data: dict, m: Manifest) -> tuple[list[str], list[str]]:
         if icon.color == "full":
             warnings.append(f"sprite {LAUNCHER_ICON_NAME!r}: color \"full\" has no transparency - the corners "
                             f"cannot be transparent")
-    if m.icon is not None and data.get("_origin") is None and icon_screen_side(m.icon) != ICON_STANDARD_SIDE:
-        warnings.append(f"icon: {{\"color\": \"{m.icon.color}\", \"side\": {m.icon.side}}} draws the launcher icon at "
-                        f"{icon_screen_side(m.icon)} px on the cube, every other game's icon is "
-                        f"{ICON_STANDARD_SIDE} px: use {{\"color\": \"palette\", \"side\": 160}}")
+    if m.icon is not None and icon_screen_side(m.icon) != ICON_STANDARD_SIDE:
+        # An error, not a warning: an autonomous run reads past warnings, and a game reached the store with a
+        # 240 px icon that way. An extracted game (`_origin`) carries its original icon, whatever size its author
+        # packed: named here, and measured for real in the built pack (pack_beta.verify_oct).
+        wrong = (f"icon: {{\"color\": \"{m.icon.color}\", \"side\": {m.icon.side}}} draws the launcher icon at "
+                 f"{icon_screen_side(m.icon)} px on the cube, every other game's icon is "
+                 f"{ICON_STANDARD_SIDE} px: use {{\"color\": \"palette\", \"side\": 160}}")
+        (errors if data.get("_origin") is None else warnings).append(wrong)
 
     panoramas = data.get("_panoramas")
     if panoramas is not None and not isinstance(panoramas, dict):

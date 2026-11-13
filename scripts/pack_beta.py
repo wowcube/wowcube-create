@@ -1873,6 +1873,89 @@ def app_name_of(app_dir: str | Path) -> str:
     return targets[0].stem if targets else app_dir.name
 
 
+ICON_STANDARD_SIDE = 160        # the launcher's slots are laid out for a 160 px icon (manifest_schema)
+ICON_SMALL_SIDE = 120           # a painted badge under this looks smaller than the others (standard hexagon: 144x130)
+ICON_VISIBLE_ALPHA = 32         # alpha above this is a painted pixel of the badge (as scripts/icon_badge.py)
+_ICON_FIX = ('pack the 160x160 badge (scripts/icon_badge.py make <picture> --out app_<game>/art/icon.png) with '
+             '"icon": {"color": "palette", "side": 160} in the manifest')
+
+
+def _asset_payload(blob: bytes, asset: dict) -> bytes | None:
+    o, n = asset.get("offset"), asset.get("size")
+    if not isinstance(o, int) or not isinstance(n, int) or o <= 0 or n <= 0 or o + n > len(blob):
+        return None
+    return blob[o:o + n]
+
+
+def launcher_icon_on_screen(blob: bytes, assets: list[dict]) -> dict | None:
+    """What the launcher draws for MAP "ico", in screen pixels: {"name", "packed": (w, h), "scale": 1 | 2,
+    "canvas": (w, h), "visible": (w, h)}. None when the map is not one sprite placed once (a hand-made
+    art/ico.psd with several layers) or its sprite cannot be read: nothing to measure.
+
+    The map centres its sprite on the 240 px screen (build_map: x 120, y 120), so only the size matters: a
+    FULLSIZE sprite is drawn 1:1, any other one x2. `visible` is the bounding box of the painted pixels (alpha
+    above ICON_VISIBLE_ALPHA; the whole canvas for a sprite without transparency, or when the picture cannot
+    be decoded here): a standard badge on a bigger transparent canvas looks exactly like the standard icon."""
+    ico = next((a for a in assets if a.get("kind") == "MAP" and a.get("name") == "ico"), None)
+    payload = _asset_payload(blob, ico) if ico else None
+    if payload is None or len(payload) < 8 + 28 or struct.unpack_from("<ii", payload, 0) != (1, 1):
+        return None
+    bmp_id, = struct.unpack_from("<h", payload, 8 + 16)          # octPlace_t.BmpIdx (build_map)
+    if not 0 < bmp_id < len(assets) or assets[bmp_id].get("kind") != "SPRITE":
+        return None
+    sprite = _asset_payload(blob, assets[bmp_id])
+    if sprite is None or len(sprite) < BMP_SIZE:
+        return None
+    hdr = parse_bmp_header(sprite)
+    if hdr.w <= 0 or hdr.h <= 0:
+        return None
+    scale = 1 if hdr.flags & OCT_FLAG_FULLSIZE else 2
+    visible = (hdr.w, hdr.h)
+    if hdr.flags & OCT_FLAG_ALPHA and not hdr.flags & OCT_FLAG_RAW565:
+        try:
+            import numpy as np
+
+            import extract_art
+            pal = _asset_payload(blob, assets[hdr.pidx]) if 0 < hdr.pidx < len(assets) else None
+            if pal is not None:
+                image, _info = extract_art.decode_sprite(sprite, {hdr.pidx: extract_art.pal_rgba(extract_art._words(pal))})
+                painted = np.asarray(image.convert("RGBA"))[:, :, 3] > ICON_VISIBLE_ALPHA
+                ys, xs = np.nonzero(painted)
+                visible = (int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)) if painted.any() else (0, 0)
+        except (ImportError, ValueError, IndexError, KeyError, struct.error):
+            pass                                                  # judged by its canvas
+    return {"name": assets[bmp_id].get("name"), "packed": (hdr.w, hdr.h), "scale": scale,
+            "canvas": (hdr.w * scale, hdr.h * scale), "visible": (visible[0] * scale, visible[1] * scale)}
+
+
+def launcher_icon_findings(blob: bytes, assets: list[dict]) -> tuple[list[str], list[str]]:
+    """(errors, warnings) about the size of the launcher icon a pack really carries. An icon painted bigger than
+    the launcher's 160 px slot is an error: it looks bigger than every other icon and runs under the title."""
+    icon = launcher_icon_on_screen(blob, assets)
+    if icon is None:
+        return [], ["the launcher icon (MAP 'ico') is not one sprite placed once: its size on the cube was not "
+                    "measured - compare it with another game's icon on the cube"]
+    side = ICON_STANDARD_SIDE
+    (pw, ph), (cw, ch), (vw, vh) = icon["packed"], icon["canvas"], icon["visible"]
+    how = f"packed {pw}x{ph}, drawn {'x2' if icon['scale'] == 2 else '1:1'}"
+    if max(vw, vh) > side:
+        return [f"the launcher icon is {vw}x{vh} px on the cube ({how}): the launcher's slots are laid out for "
+                f"{side} px, so it looks bigger than every other icon and runs under the title - {_ICON_FIX}"], []
+    if min(vw, vh) <= 0:
+        return [f"the launcher icon has no painted pixel ({how}): the launcher would show an empty slot - "
+                f"{_ICON_FIX}"], []
+    small = max(vw, vh) < ICON_SMALL_SIDE
+    if (cw, ch) != (side, side):
+        fits = ("is much smaller than the launcher's slot: it will look smaller than the other icons" if small
+                else "fits the launcher's slot")
+        return [], [f"the launcher icon's canvas is {cw}x{ch} px on the cube ({how}), not the standard "
+                    f"{side}x{side}; its painted part ({vw}x{vh}) {fits} - {_ICON_FIX}"]
+    if small:
+        return [], [f"the launcher icon paints only {vw}x{vh} px of its {side}x{side} canvas: it will look smaller "
+                    f"than the other icons (the standard hexagon is 144x130) - {_ICON_FIX}"]
+    return [], []
+
+
 def verify_oct(oct_path: str | Path, app_dir: str | Path, *, code_bin: str | Path | None = None,
                info: dict | None = None) -> tuple[list[str], list[str], dict]:
     """Check a built .oct against the app it was built from.
@@ -1882,7 +1965,9 @@ def verify_oct(oct_path: str | Path, app_dir: str | Path, *, code_bin: str | Pat
     bytes 8..Size wrong, code_size/code_offset not describing the file's tail,
     the tail != out/<app>.bin, an all-zero build id, title / version / GUID /
     categories / save size != the app's defines (read_app_defines of
-    src/app.h, which follows app_metadata.h and app_save.h), no MAP "ico", or
+    src/app.h, which follows app_metadata.h and app_save.h), no MAP "ico", a
+    launcher icon painted bigger than the launcher's 160 px slot
+    (launcher_icon_findings), or
     a descriptor table that differs from the app's index.bin. Anything that
     cannot be checked (no src/app.h, an unparsable define, no .bin) is an
     error too: verification never passes by skipping. `info` = the parsed
@@ -1977,6 +2062,19 @@ def verify_oct(oct_path: str | Path, app_dir: str | Path, *, code_bin: str | Pat
     if not any(a.get("kind") == "MAP" and a.get("name") == "ico" for a in assets):
         errors.append("no MAP 'ico' in the pack: the launcher would show an empty slot (pack the icon: --icon / "
                       "art/ico.psd)")
+    else:
+        # measured on the file itself: octpack-info's asset list need not carry offsets
+        try:
+            local_assets = assets if info is None else read_oct_assets(blob, read_oct_header(blob))
+        except (KeyError, TypeError, ValueError, struct.error):
+            local_assets = None
+        if local_assets is not None:
+            icon_errors, icon_warnings = launcher_icon_findings(blob, local_assets)
+            errors += icon_errors
+            warnings += icon_warnings
+        else:
+            warnings.append("the launcher icon's size on the cube was not measured: the descriptor table of the "
+                            "pack could not be read locally")
     index = app_dir / "index.bin"
     if index.is_file():
         try:
@@ -2021,7 +2119,7 @@ def _verify_main(args) -> int:
         print(f"VERIFY FAILED: {len(errors)} problem(s) in {args.verify_oct}")
         return 1
     print(f"VERIFY OK: {args.verify_oct} (magic, size, crc, ARM tail, build id, metadata == app defines, "
-          f"MAP ico, assets == index.bin)")
+          f"MAP ico, launcher icon within 160 px, assets == index.bin)")
     if header and semver_str(header.get("app_version", 0)):
         print(f"VERSION={semver_str(header['app_version'])}")
     return 0

@@ -66,7 +66,11 @@ The launcher icon's tier comes from the manifest `icon` object; `pack.py --icon-
 drawn 1:1 with its own palette, the PNG's alpha kept as index 0 (transparent corners), the same shape every
 shipped game uses. Without an `icon` object it is full colour 160 (RAW565: the right size, black corners).
 Palette 120 (drawn ×2) and 240 exist only for games packed that way before: both show the icon at 240 px,
-bigger than every other icon on the launcher.
+bigger than every other icon on the launcher. Two checks stop that from shipping: `validate` refuses an `icon`
+object that is not 160 px on the cube (an error; a warning only for an extracted game, which carries its
+original icon), and the device build measures the icon the `.oct` really packs (`pack_beta.py --verify-oct`,
+run by `build_device`): an icon painted wider or taller than 160 px on the cube fails the build, whatever the
+manifest or an `--icon-side` override said. The painted part is measured, not the canvas.
 
 ## Direct pack.py calls (rarely needed)
 
