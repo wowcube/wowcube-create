@@ -21,10 +21,11 @@
 .PARAMETER ArmGcc
     Path to arm-none-eabi-g++ for the device check (default: PATH, then the Arm GNU Toolchain install folders).
 .PARAMETER NoDeviceCheck
-    Skip the device check: the snapshot compiled with arm-none-eabi-g++ and the cube's flags (api\apps:
-    -Werror, -Werror=double-promotion, -Werror=float-conversion, -fsingle-precision-constant), syntax only. It is
-    the authority on float rules: clang has no -fsingle-precision-constant, so the plugin evaluates an unsuffixed
-    literal in double where the cube uses float.
+    Skip the device check: the snapshot compiled and linked with arm-none-eabi-g++, the cube's flags (api\apps:
+    -Werror, -Werror=double-promotion, -Werror=float-conversion, -fsingle-precision-constant, -flto) and its linker
+    script (-nostdlib, libgcc, 256 KB). It is the authority on float rules (clang has no -fsingle-precision-constant,
+    so the plugin evaluates an unsuffixed literal in double where the cube uses float) and on what links: a call the
+    cube does not provide, or a module over 256 KB, fails here and not only in build_device.
 .PARAMETER AllowDoubleLiterals
     Skip the float-literal rule (tools\sim\game_lint.py): by default an unsuffixed floating literal in src\ (0.5
     instead of 0.5f) fails the build, because the cube reads it as float (-fsingle-precision-constant) and clang
@@ -57,7 +58,8 @@ param(
 $ErrorActionPreference = 'Stop'
 function Fail($m, $code = 1) { Write-Host "ERROR: $m" -ForegroundColor Red; exit $code }
 # exit codes: 0 ok; 1 any other failure (clang-cl / Visual Studio, game_lint, the plugin compile); 3 arm-none-eabi-g++
-# not found (device check); 4 the game fails the device check (arm-none-eabi-g++, the cube's -Werror flags)
+# not found (device check); 4 the game fails the device check (arm-none-eabi-g++, the cube's -Werror flags, the
+# module link); 5 the plugin DLL is held by a running simulator (it would go on running the old build)
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 # the public game API: the headers a game compiles against (api\include), the plugin entry point (api\plugin) and the
@@ -136,11 +138,13 @@ if ($AllowDoubleLiterals) { $lintArgs += '--allow-double-literals'; Write-Host "
 & $py @lintArgs | Out-Host
 if ($LASTEXITCODE -ne 0) { Fail "the game's sources break a simulator/cube parity rule (above; file:line in src\)" }
 
-# --- device check: the same sources through the cube's compiler and flags ------
+# --- device check: the same sources through the cube's compiler, flags and linker -----
 # clang has no -fsingle-precision-constant, so an unsuffixed literal (x * 0.5) is evaluated in double here and in float
 # on the cube, and the device's -Werror=double-promotion / -Werror=float-conversion are not the plugin's rules. The
-# authority is the device build: compile the snapshot with arm-none-eabi-g++ and api\apps' flags (syntax and
-# diagnostics only, nothing is written), so a game that would not build for the cube fails HERE, before any run.
+# authority is the device build: compile AND link the snapshot with arm-none-eabi-g++, api\apps' flags and its linker
+# script (-nostdlib, libgcc), so a game that would not build for the cube fails HERE, before any run. A compile alone
+# is not enough: a call the compiler emits for the game (64-bit division: __aeabi_ldivmod) or a module over 256 KB
+# only shows at link time. The .elf goes to obj\ and is thrown away; build_device makes the real one.
 if (-not $NoDeviceCheck) {
     if (-not $ArmGcc) {
         $c = Get-Command arm-none-eabi-g++ -ErrorAction SilentlyContinue
@@ -153,17 +157,33 @@ if (-not $NoDeviceCheck) {
     if (-not $ArmGcc -or -not (Test-Path -LiteralPath $ArmGcc)) {
         Fail "arm-none-eabi-g++ not found: the device check compiles the game as the cube does (install the Arm GNU Toolchain, or pass -ArmGcc; -NoDeviceCheck skips it, which lets device-only compile errors through)" 3
     }
+    $elf = Join-Path $tmp 'device_check.elf'
+    if (Test-Path -LiteralPath $elf) { Remove-Item -Force -LiteralPath $elf }
     $armArgs = @('-mcpu=cortex-m4', '-mthumb', '-mfloat-abi=hard', '-mfpu=fpv4-sp-d16', '-std=c++20', '-Os', '-Wall',
                  '-Werror=float-conversion', '-Werror=double-promotion', '-Werror', '-ffreestanding', '-fno-builtin',
-                 '-fsingle-precision-constant', '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexit',
-                 '-DOCT_APP_MODULE', '-fsyntax-only') + $defs + @("-I$snap", "-I$inc", (Join-Path $api 'apps\src\app_module.cpp'))
-    Write-Host "==> Device check: $(Split-Path $ArmGcc -Leaf) -Werror (api\apps flags, syntax only)" -ForegroundColor Cyan
+                 '-fsingle-precision-constant', '-fmerge-all-constants', '-ffunction-sections', '-fdata-sections', '-flto',
+                 '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexit',
+                 '-DOCT_APP_MODULE') + $defs + @("-I$snap", "-I$inc", (Join-Path $api 'apps\src\app_module.cpp'),
+                 # api\apps' link: its script (fixed address, 256 KB), no libc, libgcc for the compiler's helpers
+                 '-T', (Join-Path $api 'apps\src\app_module.ld'), '-nostdlib', '-nostartfiles', '-Wl,--gc-sections',
+                 '-lgcc', '-o', $elf)
+    Write-Host "==> Device check: $(Split-Path $ArmGcc -Leaf) -Werror, compile + link (api\apps flags and linker script)" -ForegroundColor Cyan
     $armLog = Join-Path $tmp 'device_check.log'
     $p = Start-Process -FilePath $ArmGcc -ArgumentList ($armArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -NoNewWindow -Wait -PassThru `
          -RedirectStandardError $armLog -RedirectStandardOutput (Join-Path $tmp 'device_check.out')
     if ($p.ExitCode -ne 0) {
+        $logText = if (Test-Path -LiteralPath $armLog) { Get-Content -LiteralPath $armLog -Raw } else { '' }
+        $undef = @([regex]::Matches($logText, "undefined reference to [``'](.+?)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        $over = [regex]::Match($logText, "region [``']APP' overflowed by (\d+) bytes")
         Get-Content -LiteralPath $armLog | Select-Object -First 40 | Out-Host
-        Fail "the game does not compile for the cube (arm-none-eabi-g++, device flags, -Werror) - fix it before simulating; log: $armLog" 4
+        if ($undef.Count) {
+            Fail ("the game does not link for the cube: it calls $($undef -join ', '), which the cube does not provide (a module has no libc; " +
+                  "a standard C/C++ library call or an engine function the public API does not declare) - remove the call; log: $armLog") 4
+        }
+        if ($over.Success) {
+            Fail "the game does not fit the cube: the module is $($over.Groups[1].Value) bytes over its 256 KB (code + data + .bss) - shrink it; log: $armLog" 4
+        }
+        Fail "the game does not build for the cube (arm-none-eabi-g++, device flags, -Werror) - fix it before simulating; log: $armLog" 4
     }
 }
 
@@ -195,7 +215,15 @@ exit /b 0
 "@ | Set-Content -LiteralPath $cmd -Encoding ascii
 
 Write-Host "==> Compiling $app.dll (clang-cl, MSVC ABI; log: $log)" -ForegroundColor Cyan
-if (Test-Path $dll) { Remove-Item -Force $dll }
+# A simulator that has this game open (a window the user plays in, or a hidden run still going) holds the DLL: Windows
+# refuses to replace it, and that simulator goes on running the OLD build. Say so in one line, never a stale success.
+if (Test-Path $dll) {
+    try { Remove-Item -Force -LiteralPath $dll -ErrorAction Stop }
+    catch {
+        Fail ("$app.dll is in use by a running simulator, which keeps running the old build: close the simulator window " +
+              "(a hidden run: tools\sim\stop.ps1 -RunInfo <its run_info.json>) and build again. Nothing was built.") 5
+    }
+}
 & cmd.exe /d /c (Q $cmd)
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dll)) {
     if (Test-Path $log) { Get-Content -LiteralPath $log | Where-Object { $_ -match 'error' } | Select-Object -First 40 | Out-Host }

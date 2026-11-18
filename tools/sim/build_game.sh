@@ -11,9 +11,10 @@
 # Defines (as tools/sim/build_game.ps1 -Define): the whole "#define NAME ..." (continuation lines included) in a snapshot
 # of src/ (<app_dir>/out/sim/obj/src) is replaced by the literal value, so unguarded test hooks are overridden too; a
 # NAME no source defines becomes -DNAME=VALUE.
-# Device check (default; --no-device-check skips it): the snapshot is first compiled with arm-none-eabi-g++ and the
-# cube's flags (api/apps: -Werror, -Werror=double-promotion, -Werror=float-conversion, -fsingle-precision-constant),
-# syntax only, so a game that would not build for the cube fails here. g++ plugins also get -fsingle-precision-constant
+# Device check (default; --no-device-check skips it): the snapshot is first compiled AND linked with arm-none-eabi-g++,
+# the cube's flags (api/apps: -Werror, -Werror=double-promotion, -Werror=float-conversion, -fsingle-precision-constant,
+# -flto) and api/apps' linker script (-nostdlib, libgcc, 256 KB), so a game that would not build for the cube fails here:
+# a compile error, a call the cube does not provide, a module too big. g++ plugins also get -fsingle-precision-constant
 # (the cube's float semantics); clang has no such flag (unsuffixed literals are double there), see simulator/README.md.
 # --api-dir (maintainers): compile against another header tree (include/ or engine/, plugin/, apps/src/) instead of
 # <plugin>/api: an API parity check passes a sources checkout to compare the two builds.
@@ -24,7 +25,8 @@
 # scratch folder (<ws>/.agent_scratch/pNN/build) and leaves the app folder untouched.
 # The app folder is only read, except <app_dir>/out/sim/. Starts nothing.
 # Exit codes: 0 ok; 1 any other failure (the C++ compiler, game_lint, the plugin compile); 3 arm-none-eabi-g++ not found
-# (device check); 4 the game fails the device check (arm-none-eabi-g++, the cube's -Werror flags).
+# (device check); 4 the game fails the device check (arm-none-eabi-g++, the cube's -Werror flags, the module link).
+# A simulator that already has this game open keeps running the old library: the build says so in one WARNING line.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,13 +112,27 @@ if [ "$device_check" -eq 1 ]; then
         echo "ERROR: arm-none-eabi-g++ not found: the device check compiles the game as the cube does (install the Arm GNU" >&2
         echo "       Toolchain / gcc-arm-none-eabi, or pass --arm-gcc; --no-device-check skips it and lets device-only errors through)" >&2
         exit 3; }
-    echo "==> device check: $(basename "$arm_gcc") -Werror (api/apps flags, syntax only)"
+    echo "==> device check: $(basename "$arm_gcc") -Werror, compile + link (api/apps flags and linker script)"
+    # a compile alone is not enough: a call the compiler emits for the game (64-bit division: __aeabi_ldivmod) or a module
+    # over 256 KB only shows at link time. The .elf is thrown away; build_device makes the real one.
+    rm -f "$obj/device_check.elf"
     if ! "$arm_gcc" -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -std=c++20 -Os -Wall \
             -Werror=float-conversion -Werror=double-promotion -Werror -ffreestanding -fno-builtin -fsingle-precision-constant \
-            -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit -DOCT_APP_MODULE -fsyntax-only \
-            ${dflags[@]+"${dflags[@]}"} -I"$snap" -I"$inc" "$api/apps/src/app_module.cpp" > "$obj/device_check.log" 2>&1; then
+            -fmerge-all-constants -ffunction-sections -fdata-sections -flto \
+            -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit -DOCT_APP_MODULE \
+            ${dflags[@]+"${dflags[@]}"} -I"$snap" -I"$inc" "$api/apps/src/app_module.cpp" \
+            -T "$api/apps/src/app_module.ld" -nostdlib -nostartfiles -Wl,--gc-sections -lgcc \
+            -o "$obj/device_check.elf" > "$obj/device_check.log" 2>&1; then
         head -n 40 "$obj/device_check.log" >&2
-        echo "ERROR: the game does not compile for the cube (arm-none-eabi-g++, device flags, -Werror) - fix it before simulating; log: $obj/device_check.log" >&2
+        undef="$(grep -oE "undefined reference to [\`'][^']+'" "$obj/device_check.log" | sed -E "s/^undefined reference to .//; s/'$//" | sort -u | paste -sd ',' - | sed 's/,/, /g' || true)"
+        over="$(grep -oE "region [\`']APP' overflowed by [0-9]+ bytes" "$obj/device_check.log" | grep -oE '[0-9]+' | head -n 1 || true)"
+        if [ -n "$undef" ]; then
+            echo "ERROR: the game does not link for the cube: it calls $undef, which the cube does not provide (a module has no libc; a standard C/C++ library call or an engine function the public API does not declare) - remove the call; log: $obj/device_check.log" >&2
+        elif [ -n "$over" ]; then
+            echo "ERROR: the game does not fit the cube: the module is $over bytes over its 256 KB (code + data + .bss) - shrink it; log: $obj/device_check.log" >&2
+        else
+            echo "ERROR: the game does not build for the cube (arm-none-eabi-g++, device flags, -Werror) - fix it before simulating; log: $obj/device_check.log" >&2
+        fi
         exit 4
     fi
 fi
@@ -127,6 +143,8 @@ if "$cxx" --version 2>/dev/null | grep -qiE 'gcc|g\+\+|free software foundation'
 
 lib="$out/$app.$ext"
 echo "==> compiling $lib ($cxx)"
+# a simulator that has this game open keeps the OLD library mapped after it is replaced: say so, never a silent stale run
+running="$(ps -eo pid=,args= 2>/dev/null | grep -F -- "--game $app_dir" | grep -v -F 'grep' | awk '{print $1}' | paste -sd ' ' - || true)"
 rm -f "$lib"
 set +e
 "$cxx" -std=c++20 "${opt[@]}" -fPIC -fvisibility=hidden -fno-builtin -fno-exceptions -fno-rtti \
@@ -139,6 +157,7 @@ set -e
 cat "$obj/build.log"
 [ "$rc" -eq 0 ] && [ -f "$lib" ] || { echo "ERROR: plugin build failed - log: $obj/build.log" >&2; exit 1; }
 echo "BUILD OK: $lib"
+[ -z "$running" ] || echo "WARNING: a simulator already running this game (pid $running) keeps running the OLD build: close it (a hidden run: tools/sim/stop.sh <its run_info.json>) and start it again to see this one" >&2
 [ -z "$out_dir" ] || exit 0   # a compile check: the simulator loads only <app_dir>/out/sim
 . "$here/sim_path.sh"
 echo "  run: $(sim_exe) --game $app_dir [--headless --mute --seconds 20 --frames <dir>]"

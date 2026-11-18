@@ -65,8 +65,12 @@ never patch the engine. Cube firmware older than the kit is a separate question:
 
 ARM flags: `-std=c++20 -Os -Wall -Werror -Werror=float-conversion -Werror=double-promotion -ffreestanding -fno-builtin
 -fsingle-precision-constant -fno-exceptions -fno-rtti -flto`, `-DOCT_APP_MODULE`. Any warning fails the build. The
-build prints the module size (<= 256 KB including `.bss`, link-time assert) and a list of undefined symbols that must
-be empty. Agents never start a visible simulator (headless runs only, see the orchestrator's AGENT_SAFETY.md).
+module links with `-nostdlib` plus libgcc: no libc (no `malloc`, no `printf`; `oct_freestanding.h` stands in for
+`memcpy`, `memset`, `snprintf`, `sqrtf` and a few more), but the compiler's own helpers are there, so 64-bit integer math (`int64_t` /
+`uint64_t` division and modulo) builds and runs. The build prints the module size (<= 256 KB including `.bss`,
+link-time assert) and a list of undefined symbols that must be empty. `build_game` compiles and links the module the
+same way before every plugin build (the device check, exit 4), so a game that runs in the simulator also links for
+the cube. Agents never start a visible simulator (headless runs only, see the orchestrator's AGENT_SAFETY.md).
 
 ## Callbacks
 

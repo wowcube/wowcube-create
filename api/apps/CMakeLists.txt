@@ -121,6 +121,10 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Os -flto")
 
 # Build target
 add_executable(${ELF_TARGET} ${SOURCES})
+# The compiler's own helpers (64-bit division: __aeabi_ldivmod, __aeabi_uldivmod, ...) live in libgcc, which
+# -nostdlib drops: link it back. It is static, placed at the module's fixed address like the rest of the code,
+# and needs nothing from libc. Without it such a game runs in the simulator and fails to link here.
+target_link_libraries(${ELF_TARGET} gcc)
 
 # ---- Telemetry (opt-in) --------------------------------------------------
 #

@@ -218,10 +218,15 @@ rounded back, which can differ from the cube in the last bit; `-Wdouble-promotio
 spots. Literals cannot differ: `build_game.*` first runs `tools/sim/game_lint.py` over the snapshot and refuses an
 unsuffixed floating literal (`file:line`, fix: add `f`), comments and strings ignored; an old game opts out with
 `-AllowDoubleLiterals` / `--allow-double-literals` (then its simulator floats may differ from the cube). The gate for
-everything else is the **device check** `build_game.*` runs next: the source snapshot compiled with
-`arm-none-eabi-g++` and the cube's exact flags (`-Werror`, syntax only), so a game that would not build for the cube
-fails before any simulator run. `-NoDeviceCheck` / `--no-device-check` skips it (only on a machine without the ARM
-toolchain).
+everything else is the **device check** `build_game.*` runs next: the source snapshot compiled and linked with
+`arm-none-eabi-g++`, the cube's exact flags (`-Werror`, `-flto`) and `api/apps`' linker script (`-nostdlib`, libgcc,
+256 KB), so a game that would not build for the cube fails before any simulator run: a compile error, a call the cube
+does not provide (`malloc`, a libc function: named in one line) or a module over 256 KB. A compile alone used to pass
+games whose device link then failed (a 64-bit division calls `__aeabi_ldivmod`, which lives in libgcc; the module
+build now links libgcc). `-NoDeviceCheck` / `--no-device-check` skips it (only on a machine without the ARM
+toolchain). A simulator that has the game open holds its library: on Windows `build_game.ps1` then stops with exit 5
+(close the simulator, build again) instead of leaving it on the old build; on Linux and macOS the build goes through
+and prints a WARNING that the running simulator still runs the old one.
 
 Captures (`--frames`, MCP `screens`, `record`) copy the 24 framebuffers and the topology under one lock that the modules' display DMA and module 0's topology publish also take: no torn
 screen. The lock alone does not make pixels and topology agree during a twist (module 0 may publish the new topology

@@ -127,7 +127,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <skills>\tools\sim\build_gam
 <skills>/tools/sim/build_game.sh <ws>/app_<game> --out-dir <ws>/.agent_scratch/p<NN>/build
 ```
 
-Exit 0 = `BUILD OK`; else the first errors are printed (logs in `<OutDir>/obj/`). Never hand-written
+Exit 0 = `BUILD OK`; else the first errors are printed (logs in `<OutDir>/obj/`). Exit 4 = the device
+check: it compiles AND links the module as the cube does, so "the game does not link for the cube: it calls
+X" (a libc or undeclared call: remove it; 64-bit integer math is fine, libgcc is linked) and "the module is N bytes
+over its 256 KB" are game bugs to fix like a compile error. Exit 5 (Windows) = a running simulator holds the game's
+DLL and would keep running the old build: close it (a hidden run: `stop.ps1`), then build again. Never hand-written
 compiler lines, never an engine, SDK or octavios folder outside `<skills>/simulator/` (the only engine
 the pipeline builds against). No compiler on the machine, or the ARM toolchain missing (`compile_check` fails before compiling) →
 stop and reply `"status": "error"` with the build output: a missing toolchain is an environment
